@@ -1,0 +1,7 @@
+services:
+  glip:
+    build: .
+    container_name: glip
+    restart: unless-stopped
+    env_file:
+      - .env
