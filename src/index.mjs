@@ -9,6 +9,8 @@ import {
   SlashCommandBuilder,
 } from 'discord.js';
 import {
+  findTicketSummary,
+  hasDiscordUsernameMismatch,
   normalizeTicketReference,
   validateTicket,
 } from './verify.mjs';
@@ -84,13 +86,7 @@ function isRateLimited(userId) {
   return false;
 }
 
-async function getTicket(reference) {
-  const url = new URL(
-    `https://api.tito.io/v3/${encodeURIComponent(TITO_ACCOUNT_SLUG)}/${encodeURIComponent(TITO_EVENT_SLUG)}/tickets`,
-  );
-  url.searchParams.set('q', reference);
-  url.searchParams.set('view', 'extended');
-
+async function fetchTito(url) {
   const response = await fetch(url, {
     headers: {
       Accept: 'application/json',
@@ -100,10 +96,29 @@ async function getTicket(reference) {
   });
   if (!response.ok) throw new Error(`Ti.to returned HTTP ${response.status}`);
 
-  const body = await response.json();
-  return body.tickets?.find(
-    (ticket) => normalizeTicketReference(ticket.reference) === reference,
+  return response.json();
+}
+
+async function getTicket(reference) {
+  const url = new URL(
+    `https://api.tito.io/v3/${encodeURIComponent(TITO_ACCOUNT_SLUG)}/${encodeURIComponent(TITO_EVENT_SLUG)}/tickets`,
   );
+  url.searchParams.set('page[size]', '1000');
+
+  const ticketSummary = await findTicketSummary(
+    async (page) => {
+      url.searchParams.set('page[number]', page);
+      return fetchTito(url);
+    },
+    reference,
+  );
+  if (!ticketSummary) return undefined;
+
+  const ticketUrl = new URL(
+    `https://api.tito.io/v3/${encodeURIComponent(TITO_ACCOUNT_SLUG)}/${encodeURIComponent(TITO_EVENT_SLUG)}/tickets/${encodeURIComponent(ticketSummary.slug)}`,
+  );
+  const ticketBody = await fetchTito(ticketUrl);
+  return ticketBody.ticket;
 }
 
 const failureMessage =
@@ -138,6 +153,13 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     const ticket = await getTicket(reference);
+    if (hasDiscordUsernameMismatch(ticket, interaction.user.username, questionSlug)) {
+      await interaction.editReply(
+        `The Discord username on this ticket does not match your account. Please update it in Ti.to to \`${interaction.user.username}\`, then run \`/verify\` again.`,
+      );
+      return;
+    }
+
     if (!validateTicket(ticket, interaction.user.username, questionSlug)) {
       await interaction.editReply(failureMessage);
       return;
