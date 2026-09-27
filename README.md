@@ -13,3 +13,10 @@ A bot for verifying HackNotts attendees. Connects to ti.to and checks that a use
    npm install
    npm run dev
    ```
+
+## Commands
+
+- `/verify ticket:IGLN-6` verifies  own ticket.
+- `/verify ticket:IGLN-6 user:@attendee` lets an administrator verify another server member. Must be a valid user <-> ticket pair.
+- `/checkticket ticketreference:IGLN-6` shows the attendee name, registered Discord username, ticket reference, and ticket status. Admins only.
+- `/checkuser user:@attendee` finds all tickets whose registered Discord username matches that user. Administrators only.

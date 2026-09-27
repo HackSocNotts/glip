@@ -1,19 +1,15 @@
 import {
   ActivityType,
   Client,
-  escapeMarkdown,
   GatewayIntentBits,
-  MessageFlags,
   REST,
   Routes,
-  SlashCommandBuilder,
 } from 'discord.js';
 import {
+  findAnswersForUsername,
   findTicketSummary,
-  hasDiscordUsernameMismatch,
-  normalizeTicketReference,
-  validateTicket,
 } from './verify.mjs';
+import { commands, createCommandHandler } from './commands.mjs';
 
 const requiredEnvironment = [
   'DISCORD_TOKEN',
@@ -56,21 +52,10 @@ const ticketRoleIds = {
   sponsor: SPONSOR_ROLE_ID,
 };
 
-const verifyCommand = new SlashCommandBuilder()
-  .setName('verify')
-  .setDescription('Verify your HackNotts ticket')
-  .addStringOption((option) =>
-    option
-      .setName('ticket')
-      .setDescription('Your Ti.to ticket reference, for example IGLN-6')
-      .setRequired(true)
-      .setMaxLength(32),
-  );
-
 const rest = new REST().setToken(DISCORD_TOKEN);
 await rest.put(
   Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID),
-  { body: [verifyCommand.toJSON()] },
+  { body: commands.map((command) => command.toJSON()) },
 );
 
 const attempts = new Map();
@@ -99,115 +84,71 @@ async function fetchTito(url) {
   return response.json();
 }
 
-async function getTicket(reference) {
+async function getTicketPage(page) {
   const url = new URL(
     `https://api.tito.io/v3/${encodeURIComponent(TITO_ACCOUNT_SLUG)}/${encodeURIComponent(TITO_EVENT_SLUG)}/tickets`,
   );
   url.searchParams.set('page[size]', '1000');
-
-  const ticketSummary = await findTicketSummary(
-    async (page) => {
-      url.searchParams.set('page[number]', page);
-      return fetchTito(url);
-    },
-    reference,
-  );
-  if (!ticketSummary) return undefined;
-
-  const ticketUrl = new URL(
-    `https://api.tito.io/v3/${encodeURIComponent(TITO_ACCOUNT_SLUG)}/${encodeURIComponent(TITO_EVENT_SLUG)}/tickets/${encodeURIComponent(ticketSummary.slug)}`,
-  );
-  const ticketBody = await fetchTito(ticketUrl);
-  return ticketBody.ticket;
+  url.searchParams.set('page[number]', page);
+  for (const state of ['complete', 'incomplete', 'unassigned', 'void', 'archived']) {
+    url.searchParams.append('search[states][]', state);
+  }
+  return fetchTito(url);
 }
 
-const failureMessage =
-  'That seems to be an invalid ticket number, please double check and try again.';
+async function getQuestionAnswerPage(page) {
+  const url = new URL(
+    `https://api.tito.io/v3/${encodeURIComponent(TITO_ACCOUNT_SLUG)}/${encodeURIComponent(TITO_EVENT_SLUG)}/questions/${encodeURIComponent(questionSlug)}/answers`,
+  );
+  url.searchParams.set('page[size]', '1000');
+  url.searchParams.set('page[number]', page);
+  return fetchTito(url);
+}
+
+async function getTicketBySlug(slug) {
+  const url = new URL(
+    `https://api.tito.io/v3/${encodeURIComponent(TITO_ACCOUNT_SLUG)}/${encodeURIComponent(TITO_EVENT_SLUG)}/tickets/${encodeURIComponent(slug)}`,
+  );
+  const body = await fetchTito(url);
+  return body.ticket;
+}
+
+async function getTicketsForUser(username) {
+  const answers = await findAnswersForUsername(getQuestionAnswerPage, username);
+  return Promise.all(answers.map((answer) => getTicketBySlug(answer.ticket_slug)));
+}
+
+async function getTicket(reference) {
+  const ticketSummary = await findTicketSummary(getTicketPage, reference);
+  if (!ticketSummary) return undefined;
+  return getTicketBySlug(ticketSummary.slug);
+}
+
+async function getQuestionId() {
+  const url = new URL(
+    `https://api.tito.io/v3/${encodeURIComponent(TITO_ACCOUNT_SLUG)}/${encodeURIComponent(TITO_EVENT_SLUG)}/questions`,
+  );
+  url.searchParams.set('page[size]', '1000');
+  const body = await fetchTito(url);
+  const question = body.questions?.find((item) => item.slug === questionSlug);
+  if (!question) throw new Error(`Ti.to question not found: ${questionSlug}`);
+  return question.id;
+}
+
+const questionId = await getQuestionId();
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand() || interaction.commandName !== 'verify') {
-    return;
-  }
-
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-  try {
-    if (!interaction.inGuild() || interaction.guildId !== DISCORD_GUILD_ID) {
-      await interaction.editReply('Run this command inside the HackNotts server.');
-      return;
-    }
-
-    if (isRateLimited(interaction.user.id)) {
-      await interaction.editReply('Too many attempts. Please try again later.');
-      return;
-    }
-
-    const reference = normalizeTicketReference(
-      interaction.options.getString('ticket', true),
-    );
-    if (!/^[A-Z0-9-]{3,32}$/.test(reference)) {
-      await interaction.editReply(failureMessage);
-      return;
-    }
-
-    const ticket = await getTicket(reference);
-    if (hasDiscordUsernameMismatch(ticket, interaction.user.username, questionSlug)) {
-      await interaction.editReply(
-        `The Discord username on this ticket does not match your account. Please update it in Ti.to to \`${interaction.user.username}\`, then run \`/verify\` again.`,
-      );
-      return;
-    }
-
-    if (!validateTicket(ticket, interaction.user.username, questionSlug)) {
-      await interaction.editReply(failureMessage);
-      return;
-    }
-
-    const ticketRoleId = ticketRoleIds[ticket.release_slug];
-    if (!ticketRoleId) {
-      throw new Error(`No Discord role configured for Ti.to release ${ticket.release_slug}`);
-    }
-
-    const member = await interaction.guild.members.fetch(interaction.user.id);
-    const requiredRoleIds = [VERIFIED_ROLE_ID, ticketRoleId];
-    const missingRoleIds = requiredRoleIds.filter(
-      (roleId) => !member.roles.cache.has(roleId),
-    );
-    if (!missingRoleIds.length) {
-      await interaction.editReply('You have already been verified!');
-      return;
-    }
-
-    await member.roles.add(
-      missingRoleIds,
-      `Verified Ti.to ${ticket.release_slug} ticket ${reference}`,
-    );
-
-    try {
-      const logChannel = await interaction.guild.channels.fetch(
-        VERIFICATION_LOG_CHANNEL_ID,
-      );
-      if (!logChannel?.isTextBased()) {
-        throw new Error('Verification log channel is not text-based');
-      }
-      await logChannel.send({
-        content: `${escapeMarkdown(ticket.name || 'Unknown attendee')} (<@${interaction.user.id}>) was verified and given the <@&${ticketRoleId}> role.`,
-        allowedMentions: { parse: [] },
-      });
-    } catch (error) {
-      console.error('Could not post verification update:', error);
-    }
-
-    await interaction.editReply(
-      `Thank you for verifying your ticket! You have been given the <@&${ticketRoleId}> role.`,
-    );
-  } catch (error) {
-    console.error('Verification failed:', error);
-    await interaction.editReply('Verification is temporarily unavailable. Please try again later.');
-  }
-});
+client.on('interactionCreate', createCommandHandler({
+  guildId: DISCORD_GUILD_ID,
+  verifiedRoleId: VERIFIED_ROLE_ID,
+  logChannelId: VERIFICATION_LOG_CHANNEL_ID,
+  questionSlug,
+  questionId,
+  ticketRoleIds,
+  getTicket,
+  getTicketsForUser,
+  isRateLimited,
+}));
 
 client.once('clientReady', (readyClient) => {
   readyClient.user.setPresence({

@@ -7,6 +7,17 @@ export function normalizeTicketReference(value) {
   return !reference || reference.includes('-') ? reference : `${reference}-1`;
 }
 
+export function getTicketDiscordUsername(ticket, questionSlug, questionId) {
+  const currentAnswer = questionId == null
+    ? undefined
+    : ticket?.answers?.find(
+      (answer) => String(answer.question_id) === String(questionId),
+    );
+  return currentAnswer?.response
+    ?? currentAnswer?.primary_response
+    ?? ticket?.responses?.[questionSlug];
+}
+
 export async function findTicketSummary(fetchPage, reference) {
   let page = 1;
   const normalizedReference = normalizeTicketReference(reference);
@@ -23,11 +34,27 @@ export async function findTicketSummary(fetchPage, reference) {
   return undefined;
 }
 
-export function hasDiscordUsernameMismatch(ticket, discordUsername, questionSlug) {
+export async function findAnswersForUsername(fetchPage, username) {
+  const normalizedUsername = normalizeDiscordUsername(username);
+  if (!normalizedUsername) return [];
+
+  const answers = [];
+  let page = 1;
+  while (page) {
+    const body = await fetchPage(page);
+    answers.push(...(body.answers || []).filter(
+      (answer) => normalizeDiscordUsername(answer.response) === normalizedUsername,
+    ));
+    page = body.meta?.next_page;
+  }
+  return answers;
+}
+
+export function hasDiscordUsernameMismatch(ticket, discordUsername, questionSlug, questionId) {
   if (!ticket || ticket.state !== 'complete') return false;
 
   const registeredUsername = normalizeDiscordUsername(
-    ticket.responses?.[questionSlug],
+    getTicketDiscordUsername(ticket, questionSlug, questionId),
   );
   return (
     registeredUsername !== '' &&
@@ -35,10 +62,14 @@ export function hasDiscordUsernameMismatch(ticket, discordUsername, questionSlug
   );
 }
 
-export function validateTicket(ticket, discordUsername, questionSlug) {
+export function validateTicket(ticket, discordUsername, questionSlug, questionId) {
   if (!ticket || ticket.state !== 'complete') return false;
 
-  const registeredUsername = ticket.responses?.[questionSlug];
+  const registeredUsername = getTicketDiscordUsername(
+    ticket,
+    questionSlug,
+    questionId,
+  );
   return (
     normalizeDiscordUsername(registeredUsername) !== '' &&
     normalizeDiscordUsername(registeredUsername) ===
